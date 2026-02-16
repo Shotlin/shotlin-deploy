@@ -1,6 +1,6 @@
 # ═══════════════════════════════════════════════════════
-#  Shotlin — Production Docker Compose
-#  All services behind Nginx reverse proxy with SSL
+#  Shotlin — Production Docker Compose (AWS EC2 + Cloudflare)
+#  Optimized for: 2 vCPU / 2GB RAM / 10GB SSD
 # ═══════════════════════════════════════════════════════
 
 services:
@@ -13,6 +13,30 @@ services:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
+      # Performance tuning for 2GB RAM
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=128MB"
+      - "-c"
+      - "effective_cache_size=256MB"
+      - "-c"
+      - "work_mem=4MB"
+      - "-c"
+      - "maintenance_work_mem=64MB"
+      - "-c"
+      - "max_connections=50"
+      - "-c"
+      - "log_min_duration_statement=1000"
+      - "-c"
+      - "log_checkpoints=on"
+      - "-c"
+      - "log_connections=on"
+      - "-c"
+      - "log_disconnections=on"
+      - "-c"
+      - "password_encryption=scram-sha-256"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./backups:/backups
@@ -20,11 +44,22 @@ services:
       - shotlin_internal
     healthcheck:
       test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}" ]
-      interval: 10s
+      interval: 15s
       timeout: 5s
       retries: 5
-    # Never expose postgres to the host — only internal network
-    # ports: ["5432:5432"]  # INTENTIONALLY NOT EXPOSED
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+          cpus: "0.5"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "3"
+    # PostgreSQL is NEVER exposed to the host
+    # Only accessible via internal Docker network
 
     # ─── Backend API (Fastify + Prisma) ───
   backend:
@@ -35,22 +70,33 @@ services:
     restart: unless-stopped
     environment:
       NODE_ENV: production
-      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public&connection_limit=20
       JWT_SECRET: ${JWT_SECRET}
       CLOUDINARY_CLOUD_NAME: ${CLOUDINARY_CLOUD_NAME}
       CLOUDINARY_API_KEY: ${CLOUDINARY_API_KEY}
       CLOUDINARY_API_SECRET: ${CLOUDINARY_API_SECRET}
-      ALLOWED_ORIGINS: https://${DOMAIN},https://crm.${DOMAIN}
+      ALLOWED_ORIGINS: https://${DOMAIN},https://adminpanel.${DOMAIN}
     volumes:
       - backend_uploads:/app/uploads
+    tmpfs:
+      - /tmp:size=64M
     depends_on:
       postgres:
         condition: service_healthy
     networks:
       - shotlin_internal
-    # Not exposed to host — Nginx handles external traffic
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+          cpus: "0.5"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "3"
 
-    # ─── Dashboard / CRM (Next.js) ───
+  # ─── Dashboard / Admin Panel (Next.js) ───
   dashboard:
     build:
       context: ../shotlin_dashboard
@@ -62,10 +108,22 @@ services:
     environment:
       NODE_ENV: production
       NEXT_PUBLIC_API_URL: https://api.${DOMAIN}/api/v1
+    tmpfs:
+      - /tmp:size=32M
     depends_on:
       - backend
     networks:
       - shotlin_internal
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.4"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "3"
 
   # ─── Frontend Website (Next.js) ───
   frontend:
@@ -81,12 +139,24 @@ services:
       NODE_ENV: production
       NEXT_PUBLIC_API_URL: https://api.${DOMAIN}/api/v1
       NEXT_PUBLIC_GA_ID: ${NEXT_PUBLIC_GA_ID}
+    tmpfs:
+      - /tmp:size=32M
     depends_on:
       - backend
     networks:
       - shotlin_internal
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.4"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "3"
 
-  # ─── Nginx Reverse Proxy + SSL ───
+  # ─── Nginx Reverse Proxy (Cloudflare Origin SSL) ───
   nginx:
     image: nginx:alpine
     container_name: shotlin_nginx
@@ -97,8 +167,12 @@ services:
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./nginx/conf.d:/etc/nginx/conf.d:ro
-      - ./certbot/conf:/etc/letsencrypt:ro
-      - ./certbot/www:/var/www/certbot:ro
+      - ./ssl:/etc/nginx/ssl:ro
+      - nginx_cache:/var/cache/nginx
+    tmpfs:
+      - /var/run:size=1M
+      - /tmp:size=8M
+    read_only: true
     depends_on:
       - backend
       - dashboard
@@ -110,18 +184,16 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-
-  # ─── Certbot (Let's Encrypt SSL) ───
-  certbot:
-    image: certbot/certbot
-    container_name: shotlin_certbot
-    volumes:
-      - ./certbot/conf:/etc/letsencrypt
-      - ./certbot/www:/var/www/certbot
-    # Auto-renew every 12 hours
-    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot --quiet; sleep 12h & wait $${!}; done'"
-    networks:
-      - shotlin_internal
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+          cpus: "0.2"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "3"
 
   # ─── Automated Backups ───
   backup:
@@ -142,28 +214,25 @@ services:
         condition: service_healthy
     networks:
       - shotlin_internal
-
-  # ─── Watchtower (Auto-update containers) ───
-  watchtower:
-    image: containrrr/watchtower
-    container_name: shotlin_watchtower
-    restart: unless-stopped
-    environment:
-      WATCHTOWER_CLEANUP: "true"
-      WATCHTOWER_POLL_INTERVAL: 86400 # Check every 24h
-      WATCHTOWER_LABEL_ENABLE: "false"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    networks:
-      - shotlin_internal
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.1"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "2m"
+        max-file: "2"
 
 volumes:
   postgres_data:
     driver: local
   backend_uploads:
     driver: local
+  nginx_cache:
+    driver: local
 
 networks:
   shotlin_internal:
     driver: bridge
-    internal: false # Certbot needs external access

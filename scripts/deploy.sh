@@ -1,7 +1,7 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════
-#  Shotlin — One-Command Production Deploy
-#  Usage: ./scripts/deploy.sh [--build] [--restart]
+#  Shotlin — One-Command Production Deploy v2.0
+#  AWS EC2 + Cloudflare | Optimized for 2vCPU / 2GB RAM
 # ═══════════════════════════════════════════════════════
 
 set -euo pipefail
@@ -10,18 +10,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "${SCRIPT_DIR}")"
 cd "${PROJECT_DIR}"
 
-# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 banner() {
     echo -e "${CYAN}"
     echo "  ╔═══════════════════════════════════════════╗"
-    echo "  ║         🚀 SHOTLIN DEPLOY v1.0            ║"
+    echo "  ║     🚀 SHOTLIN DEPLOY v2.0 (AWS+CF)       ║"
     echo "  ╚═══════════════════════════════════════════╝"
     echo -e "${NC}"
 }
@@ -46,7 +45,6 @@ for arg in "$@"; do
             echo "  --build     Force rebuild all images"
             echo "  --restart   Restart all services (no rebuild)"
             echo "  --help      Show this help"
-            echo ""
             exit 0
             ;;
     esac
@@ -81,18 +79,18 @@ if [ "${JWT_SECRET:-}" = "CHANGE_ME_GENERATE_WITH_openssl_rand_hex_32" ]; then
     error "You haven't set JWT_SECRET in .env — Run: openssl rand -hex 32"
 fi
 
+# Check SSL certificates
+if [ ! -f "ssl/origin.pem" ] || [ ! -f "ssl/origin-key.pem" ]; then
+    error "SSL certificates not found! Run: ./scripts/init-ssl.sh"
+fi
+
 log "Pre-flight checks passed"
 
-# ─── Check SSL ───
-if [ ! -d "certbot/conf/live/${DOMAIN}" ]; then
-    warn "SSL certificates not found!"
-    info "Run './scripts/init-ssl.sh' first to set up SSL"
-    echo ""
-    read -p "Continue without SSL (HTTP only)? [y/N] " -n 1 -r
-    echo ""
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        exit 1
-    fi
+# ─── Disk space check ───
+DISK_FREE=$(df -BM / | awk 'NR==2 {gsub("M",""); print $4}')
+if [ "${DISK_FREE}" -lt 1024 ]; then
+    warn "Low disk space: ${DISK_FREE}MB free (need >1GB)"
+    warn "Run: ./scripts/manage.sh clean"
 fi
 
 # ─── Restart only ───
@@ -105,24 +103,31 @@ fi
 
 # ─── Pull latest base images ───
 info "Pulling latest base images..."
-docker compose pull postgres nginx certbot watchtower 2>/dev/null || true
+docker compose pull postgres nginx 2>/dev/null || true
 
 # ─── Build & Deploy ───
 info "Building and deploying all services..."
 docker compose up -d ${BUILD_FLAG} --remove-orphans
 
+# ─── Cleanup dangling images (save SSD space) ───
+info "Cleaning up old images..."
+docker image prune -f 2>/dev/null || true
+
 # ─── Wait for services ───
 info "Waiting for services to become healthy..."
-sleep 10
+sleep 15
 
 # Check health
 check_service() {
     local service=$1
-    local status=$(docker inspect --format='{{.State.Health.Status}}' "shotlin_${service}" 2>/dev/null || echo "unknown")
-    if [ "${status}" = "healthy" ] || [ "${status}" = "unknown" ]; then
-        log "${service}: ${status}"
+    local container="shotlin_${service}"
+    local running=$(docker inspect --format='{{.State.Running}}' "${container}" 2>/dev/null || echo "false")
+    local health=$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}' "${container}" 2>/dev/null || echo "unknown")
+    
+    if [ "${running}" = "true" ]; then
+        log "${service}: running (${health})"
     else
-        warn "${service}: ${status}"
+        warn "${service}: NOT RUNNING"
     fi
 }
 
@@ -137,17 +142,23 @@ check_service "dashboard"
 check_service "nginx"
 echo "  └──────────────────────────────────┘"
 
+# ─── Memory usage ───
+echo ""
+info "Memory usage:"
+docker stats --no-stream --format "  {{.Name}}: {{.MemUsage}}" \
+    shotlin_postgres shotlin_backend shotlin_frontend shotlin_dashboard shotlin_nginx 2>/dev/null || true
+
 # ─── Summary ───
 echo ""
 echo -e "${GREEN}═══════════════════════════════════════════════${NC}"
 echo -e "${GREEN}  ✅ Deployment Complete!${NC}"
 echo ""
-echo -e "  🌐 Frontend:   https://${DOMAIN}"
-echo -e "  📊 Dashboard:  https://crm.${DOMAIN}"
-echo -e "  🔌 API:        https://api.${DOMAIN}"
+echo -e "  🌐 Frontend:    https://${DOMAIN}"
+echo -e "  📊 Admin Panel: https://adminpanel.${DOMAIN}"
+echo -e "  🔌 API:         https://api.${DOMAIN}"
 echo -e ""
-echo -e "  📋 Logs:       docker compose logs -f"
-echo -e "  🔄 Restart:    ./scripts/deploy.sh --restart"
-echo -e "  🔨 Rebuild:    ./scripts/deploy.sh --build"
-echo -e "  💾 Backup now: ./scripts/manage.sh backup"
+echo -e "  📋 Logs:        docker compose logs -f"
+echo -e "  🔄 Restart:     ./scripts/deploy.sh --restart"
+echo -e "  🔨 Rebuild:     ./scripts/deploy.sh --build"
+echo -e "  💾 Backup now:  ./scripts/manage.sh backup"
 echo -e "${GREEN}═══════════════════════════════════════════════${NC}"

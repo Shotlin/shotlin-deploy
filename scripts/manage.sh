@@ -1,6 +1,6 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════
-#  Shotlin — Management Commands
+#  Shotlin — Management Commands v2.0
 #  Usage: ./scripts/manage.sh <command>
 # ═══════════════════════════════════════════════════════
 
@@ -21,30 +21,31 @@ NC='\033[0m'
 show_help() {
     echo -e "${CYAN}"
     echo "  ╔═══════════════════════════════════════════╗"
-    echo "  ║      🛠  SHOTLIN MANAGEMENT CLI            ║"
+    echo "  ║    🛠  SHOTLIN MANAGEMENT CLI v2.0          ║"
     echo "  ╚═══════════════════════════════════════════╝"
     echo -e "${NC}"
     echo "Usage: ./scripts/manage.sh <command>"
     echo ""
     echo "Commands:"
-    echo "  status       Show status of all services"
-    echo "  logs         Follow all logs (Ctrl+C to stop)"
-    echo "  logs-api     Follow backend API logs only"
-    echo "  logs-web     Follow frontend logs only"
-    echo "  logs-crm     Follow dashboard logs only"
-    echo "  backup       Create an immediate database backup"
-    echo "  restore      Restore from a backup file"
-    echo "  shell-db     Open PostgreSQL interactive shell"
-    echo "  shell-api    Open shell in backend container"
-    echo "  seed-admin   Create/reset admin user"
-    echo "  migrate      Run database migrations"
-    echo "  ssl-status   Check SSL certificate status"
-    echo "  ssl-renew    Force SSL certificate renewal"
-    echo "  update       Pull latest images and redeploy"
-    echo "  stop         Stop all services"
-    echo "  down         Stop and remove all containers"
-    echo "  disk         Show disk usage"
-    echo "  clean        Remove unused Docker resources"
+    echo "  status         Show status of all services"
+    echo "  logs           Follow all logs (Ctrl+C to stop)"
+    echo "  logs-api       Follow backend API logs only"
+    echo "  logs-web       Follow frontend logs only"
+    echo "  logs-admin     Follow admin panel logs only"
+    echo "  backup         Create an immediate database backup"
+    echo "  restore        Restore from a backup file"
+    echo "  shell-db       Open PostgreSQL interactive shell"
+    echo "  shell-api      Open shell in backend container"
+    echo "  seed-admin     Create/reset admin user"
+    echo "  migrate        Run database migrations"
+    echo "  ssl-check      Check SSL certificate validity"
+    echo "  update-cf-ips  Update Cloudflare IP whitelist"
+    echo "  update         Pull latest images and redeploy"
+    echo "  stop           Stop all services"
+    echo "  down           Stop and remove all containers"
+    echo "  disk           Show disk usage"
+    echo "  clean          Remove unused Docker resources"
+    echo "  security       Run security audit"
     echo ""
 }
 
@@ -54,8 +55,11 @@ case "${1:-help}" in
         docker compose ps
         echo ""
         echo -e "${CYAN}═══ Resource Usage ═══${NC}\n"
-        docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}" \
+        docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.NetIO}}" \
             shotlin_postgres shotlin_backend shotlin_frontend shotlin_dashboard shotlin_nginx 2>/dev/null || true
+        echo ""
+        echo -e "${CYAN}═══ Disk ═══${NC}\n"
+        df -h / | awk 'NR==1 || NR==2'
         ;;
 
     logs)
@@ -70,14 +74,15 @@ case "${1:-help}" in
         docker compose logs -f --tail=100 frontend
         ;;
 
-    logs-crm)
+    logs-admin)
         docker compose logs -f --tail=100 dashboard
         ;;
 
     backup)
         echo -e "${GREEN}Creating immediate backup...${NC}"
+        mkdir -p backups
         TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
-        docker compose exec postgres pg_dump -U "${POSTGRES_USER}" "${POSTGRES_DB}" -Fc | \
+        docker compose exec -T postgres pg_dump -U "${POSTGRES_USER}" -Fc "${POSTGRES_DB}" | \
             gzip > "backups/manual_${TIMESTAMP}.sql.gz"
         SIZE=$(du -h "backups/manual_${TIMESTAMP}.sql.gz" | cut -f1)
         echo -e "${GREEN}✅ Backup saved: backups/manual_${TIMESTAMP}.sql.gz (${SIZE})${NC}"
@@ -130,22 +135,37 @@ case "${1:-help}" in
         echo -e "${GREEN}✅ Migrations applied${NC}"
         ;;
 
-    ssl-status)
+    ssl-check)
         echo -e "\n${CYAN}═══ SSL Certificate Status ═══${NC}\n"
-        docker compose run --rm certbot certificates
+        if [ -f "ssl/origin.pem" ]; then
+            openssl x509 -in ssl/origin.pem -noout -subject -dates -issuer
+            echo ""
+            EXPIRY=$(openssl x509 -in ssl/origin.pem -noout -enddate | cut -d= -f2)
+            echo -e "  Expires: ${EXPIRY}"
+            EXPIRY_EPOCH=$(date -d "${EXPIRY}" +%s 2>/dev/null || date -j -f "%b %d %H:%M:%S %Y %Z" "${EXPIRY}" +%s 2>/dev/null || echo "0")
+            NOW_EPOCH=$(date +%s)
+            if [ "${EXPIRY_EPOCH}" -gt 0 ]; then
+                DAYS_LEFT=$(( (EXPIRY_EPOCH - NOW_EPOCH) / 86400 ))
+                echo -e "  Days left: ${DAYS_LEFT}"
+            fi
+        else
+            echo -e "${RED}No certificate found at ssl/origin.pem${NC}"
+        fi
         ;;
 
-    ssl-renew)
-        echo "Forcing SSL renewal..."
-        docker compose run --rm certbot renew --force-renewal
+    update-cf-ips)
+        echo "Updating Cloudflare IP ranges..."
+        ./scripts/update-cloudflare-ips.sh
+        echo "Reloading Nginx..."
         docker compose exec nginx nginx -s reload
-        echo -e "${GREEN}✅ SSL certificates renewed and Nginx reloaded${NC}"
+        echo -e "${GREEN}✅ Cloudflare IPs updated and Nginx reloaded${NC}"
         ;;
 
     update)
         echo "Pulling latest images and redeploying..."
-        docker compose pull
+        docker compose pull postgres nginx
         docker compose up -d --build --remove-orphans
+        docker image prune -f 2>/dev/null || true
         echo -e "${GREEN}✅ Update complete${NC}"
         ;;
 
@@ -166,21 +186,70 @@ case "${1:-help}" in
 
     disk)
         echo -e "\n${CYAN}═══ Disk Usage ═══${NC}\n"
+        echo "System disk:"
+        df -h / | awk 'NR==1 || NR==2'
+        echo ""
         echo "Docker images:"
-        docker images --format "table {{.Repository}}\t{{.Tag}}\t{{.Size}}" | grep -i shotlin || echo "  Not built yet"
+        docker images --format "table {{.Repository}}\t{{.Tag}}\t{{.Size}}" | head -20
         echo ""
         echo "Docker volumes:"
-        docker volume ls --format "table {{.Name}}\t{{.Driver}}" | grep -i shotlin || echo "  None"
+        docker system df -v 2>/dev/null | head -20
         echo ""
         echo "Backups:"
         du -sh backups/ 2>/dev/null || echo "  No backups"
+        echo ""
+        echo "Total Docker disk usage:"
+        docker system df 2>/dev/null
         ;;
 
     clean)
         echo "Cleaning unused Docker resources..."
         docker system prune -f
         docker image prune -f
+        docker volume prune -f 2>/dev/null || true
         echo -e "${GREEN}✅ Cleanup complete${NC}"
+        echo ""
+        echo "Disk after cleanup:"
+        df -h / | awk 'NR==1 || NR==2'
+        ;;
+
+    security)
+        echo -e "\n${CYAN}═══ Security Audit ═══${NC}\n"
+        
+        echo "1. SSL Certificate:"
+        openssl x509 -in ssl/origin.pem -noout -dates 2>/dev/null && echo "   ✅ Valid" || echo "   ❌ Invalid"
+        
+        echo ""
+        echo "2. Open Ports (should only be 22, 80, 443):"
+        ss -tlnp 2>/dev/null | grep LISTEN || netstat -tlnp 2>/dev/null | grep LISTEN
+        
+        echo ""
+        echo "3. Firewall Status:"
+        sudo ufw status 2>/dev/null || echo "   UFW not available"
+        
+        echo ""
+        echo "4. Failed SSH attempts (last 24h):"
+        journalctl -u ssh --since "24 hours ago" 2>/dev/null | grep -c "Failed" || echo "   0"
+        
+        echo ""
+        echo "5. Docker containers running as root:"
+        docker ps --format "{{.Names}}" | while read name; do
+            USER=$(docker inspect --format='{{.Config.User}}' "$name" 2>/dev/null)
+            if [ -z "$USER" ] || [ "$USER" = "root" ] || [ "$USER" = "0" ]; then
+                echo "   ⚠️ ${name}: running as root"
+            else
+                echo "   ✅ ${name}: running as ${USER}"
+            fi
+        done
+        
+        echo ""
+        echo "6. Environment file permissions:"
+        PERM=$(stat -c %a .env 2>/dev/null || stat -f %A .env 2>/dev/null)
+        if [ "${PERM}" = "600" ]; then
+            echo "   ✅ .env: ${PERM} (secure)"
+        else
+            echo "   ⚠️ .env: ${PERM} (should be 600 — run: chmod 600 .env)"
+        fi
         ;;
 
     help|--help|-h)
