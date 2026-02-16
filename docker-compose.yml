@@ -208,7 +208,8 @@ services:
     volumes:
       - ./backups:/backups
       - ./scripts/backup.sh:/backup.sh:ro
-    entrypoint: "/bin/sh -c 'chmod +x /backup.sh && /backup.sh'"
+    command: >
+      /bin/sh -c '/backup.sh'
     depends_on:
       postgres:
         condition: service_healthy
