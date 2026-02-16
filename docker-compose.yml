@@ -76,6 +76,7 @@ services:
       CLOUDINARY_API_KEY: ${CLOUDINARY_API_KEY}
       CLOUDINARY_API_SECRET: ${CLOUDINARY_API_SECRET}
       ALLOWED_ORIGINS: https://${DOMAIN},https://adminpanel.${DOMAIN}
+      COOKIE_DOMAIN: .${DOMAIN}
     volumes:
       - backend_uploads:/app/uploads
     tmpfs:
@@ -139,6 +140,7 @@ services:
       NODE_ENV: production
       NEXT_PUBLIC_API_URL: https://api.${DOMAIN}/api/v1
       NEXT_PUBLIC_GA_ID: ${NEXT_PUBLIC_GA_ID}
+      INTERNAL_API_URL: http://backend:4000/api/v1
     tmpfs:
       - /tmp:size=32M
     depends_on:
