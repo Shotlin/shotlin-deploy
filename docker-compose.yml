@@ -1,0 +1,169 @@
+# ═══════════════════════════════════════════════════════
+#  Shotlin — Production Docker Compose
+#  All services behind Nginx reverse proxy with SSL
+# ═══════════════════════════════════════════════════════
+
+services:
+  # ─── PostgreSQL Database ───
+  postgres:
+    image: postgres:16-alpine
+    container_name: shotlin_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backups:/backups
+    networks:
+      - shotlin_internal
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # Never expose postgres to the host — only internal network
+    # ports: ["5432:5432"]  # INTENTIONALLY NOT EXPOSED
+
+    # ─── Backend API (Fastify + Prisma) ───
+  backend:
+    build:
+      context: ../shotlin_backend
+      dockerfile: Dockerfile
+    container_name: shotlin_backend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
+      JWT_SECRET: ${JWT_SECRET}
+      CLOUDINARY_CLOUD_NAME: ${CLOUDINARY_CLOUD_NAME}
+      CLOUDINARY_API_KEY: ${CLOUDINARY_API_KEY}
+      CLOUDINARY_API_SECRET: ${CLOUDINARY_API_SECRET}
+      ALLOWED_ORIGINS: https://${DOMAIN},https://crm.${DOMAIN}
+    volumes:
+      - backend_uploads:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - shotlin_internal
+    # Not exposed to host — Nginx handles external traffic
+
+    # ─── Dashboard / CRM (Next.js) ───
+  dashboard:
+    build:
+      context: ../shotlin_dashboard
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: https://api.${DOMAIN}/api/v1
+    container_name: shotlin_dashboard
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      NEXT_PUBLIC_API_URL: https://api.${DOMAIN}/api/v1
+    depends_on:
+      - backend
+    networks:
+      - shotlin_internal
+
+  # ─── Frontend Website (Next.js) ───
+  frontend:
+    build:
+      context: ../shotlin_frontend_next_js
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: https://api.${DOMAIN}/api/v1
+        NEXT_PUBLIC_GA_ID: ${NEXT_PUBLIC_GA_ID}
+    container_name: shotlin_frontend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      NEXT_PUBLIC_API_URL: https://api.${DOMAIN}/api/v1
+      NEXT_PUBLIC_GA_ID: ${NEXT_PUBLIC_GA_ID}
+    depends_on:
+      - backend
+    networks:
+      - shotlin_internal
+
+  # ─── Nginx Reverse Proxy + SSL ───
+  nginx:
+    image: nginx:alpine
+    container_name: shotlin_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./certbot/conf:/etc/letsencrypt:ro
+      - ./certbot/www:/var/www/certbot:ro
+    depends_on:
+      - backend
+      - dashboard
+      - frontend
+    networks:
+      - shotlin_internal
+    healthcheck:
+      test: [ "CMD", "nginx", "-t" ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ─── Certbot (Let's Encrypt SSL) ───
+  certbot:
+    image: certbot/certbot
+    container_name: shotlin_certbot
+    volumes:
+      - ./certbot/conf:/etc/letsencrypt
+      - ./certbot/www:/var/www/certbot
+    # Auto-renew every 12 hours
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot --quiet; sleep 12h & wait $${!}; done'"
+    networks:
+      - shotlin_internal
+
+  # ─── Automated Backups ───
+  backup:
+    image: postgres:16-alpine
+    container_name: shotlin_backup
+    restart: unless-stopped
+    environment:
+      PGHOST: postgres
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB}
+    volumes:
+      - ./backups:/backups
+      - ./scripts/backup.sh:/backup.sh:ro
+    entrypoint: "/bin/sh -c 'chmod +x /backup.sh && /backup.sh'"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - shotlin_internal
+
+  # ─── Watchtower (Auto-update containers) ───
+  watchtower:
+    image: containrrr/watchtower
+    container_name: shotlin_watchtower
+    restart: unless-stopped
+    environment:
+      WATCHTOWER_CLEANUP: "true"
+      WATCHTOWER_POLL_INTERVAL: 86400 # Check every 24h
+      WATCHTOWER_LABEL_ENABLE: "false"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - shotlin_internal
+
+volumes:
+  postgres_data:
+    driver: local
+  backend_uploads:
+    driver: local
+
+networks:
+  shotlin_internal:
+    driver: bridge
+    internal: false # Certbot needs external access
